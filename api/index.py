@@ -249,35 +249,40 @@ async def _find_exercise(
     difficulty: str,
 ) -> Optional[dict]:
     """Look up an exercise by name (ilike contains), fall back to muscle group."""
-    # Use the most significant word (longest, > 3 chars) for the search
-    keywords = sorted(
-        [w for w in name.lower().split() if len(w) > 3],
-        key=len, reverse=True,
-    )
-    for kw in keywords[:2]:
-        r = await client.get(
-            f"{SUPABASE_REST}/exercises",
-            headers=DB_HEADERS,
-            params={"select": "id,name,gif_url,muscle_group",
-                    "name": f"ilike.*{kw}*", "limit": "1"},
+    try:
+        keywords = sorted(
+            [w for w in re.sub(r"[^\w\s]", "", name.lower()).split() if len(w) > 3],
+            key=len, reverse=True,
         )
-        rows = r.json() if r.is_success and isinstance(r.json(), list) else []
-        if rows:
-            return rows[0]
+        for kw in keywords[:2]:
+            r = await client.get(
+                f"{SUPABASE_REST}/exercises",
+                headers=DB_HEADERS,
+                params={"select": "id,name,gif_url,muscle_group",
+                        "name": f"ilike.*{kw}*", "limit": "1"},
+            )
+            if r.is_success:
+                data = r.json()
+                rows = data if isinstance(data, list) else []
+                if rows:
+                    return rows[0]
 
-    # Fallback: pick by muscle group + difficulty
-    for muscle in fallback_muscles:
-        r = await client.get(
-            f"{SUPABASE_REST}/exercises",
-            headers=DB_HEADERS,
-            params={"select": "id,name,gif_url,muscle_group",
-                    "muscle_group": f"eq.{muscle}",
-                    "difficulty": f"eq.{difficulty}",
-                    "limit": "5"},
-        )
-        rows = r.json() if r.is_success and isinstance(r.json(), list) else []
-        if rows:
-            return random.choice(rows)
+        for muscle in fallback_muscles:
+            r = await client.get(
+                f"{SUPABASE_REST}/exercises",
+                headers=DB_HEADERS,
+                params={"select": "id,name,gif_url,muscle_group",
+                        "muscle_group": f"eq.{muscle}",
+                        "difficulty": f"eq.{difficulty}",
+                        "limit": "5"},
+            )
+            if r.is_success:
+                data = r.json()
+                rows = data if isinstance(data, list) else []
+                if rows:
+                    return random.choice(rows)
+    except Exception:
+        pass
 
     return None
 
@@ -287,14 +292,23 @@ async def _fetch_video_pool(
     categories: list[str],
     n: int,
 ) -> list[dict]:
+    if not categories:
+        return []
     cat_filter = "(" + ",".join(categories) + ")"
-    r = await client.get(
-        f"{SUPABASE_REST}/youtube_videos",
-        headers=DB_HEADERS,
-        params={"select": "id,title,youtube_url,channel_name",
-                "category": f"in.{cat_filter}", "limit": str(n)},
-    )
-    rows = r.json() if r.is_success and isinstance(r.json(), list) else []
+    try:
+        r = await client.get(
+            f"{SUPABASE_REST}/youtube_videos",
+            headers=DB_HEADERS,
+            params={"select": "id,title,video_id,channel_name,category",
+                    "category": f"in.{cat_filter}", "limit": str(n)},
+        )
+        if r.is_success:
+            data = r.json()
+            rows = data if isinstance(data, list) else []
+        else:
+            rows = []
+    except Exception:
+        rows = []
     random.shuffle(rows)
     return rows
 
@@ -310,20 +324,36 @@ async def _build_schedule(
 
     active_days = [d for d in days if not d["is_rest"]]
 
-    # Pre-fetch a video pool large enough to give each active day 2 unique videos
-    needed = len(active_days) * 3
-    # Collect all categories needed across active days
     all_cats: list[str] = []
     for d in active_days:
         all_cats.extend(_focus_to_video_cats(d["focus"], fitness_goal))
-    unique_cats = list(dict.fromkeys(all_cats))  # preserve order, deduplicate
+    unique_cats = list(dict.fromkeys(all_cats))
 
     async with httpx.AsyncClient(timeout=12.0) as client:
-        video_pool = await _fetch_video_pool(client, unique_cats, max(needed, 20))
+        video_pool = await _fetch_video_pool(client, unique_cats, max(len(active_days) * 3, 20))
 
-        # Per-day exercise lookup — all concurrent
+        # Build ALL exercise tasks for ALL active days at once, then run concurrently
+        task_index: list[tuple[int, str]] = []   # (day_idx, exercise_name)
+        all_ex_tasks = []
+        for day_idx, day in enumerate(days):
+            if day["is_rest"]:
+                continue
+            fallback = _focus_to_muscle_groups(day["focus"])
+            for name in day["exercise_names"]:
+                task_index.append((day_idx, name))
+                all_ex_tasks.append(_find_exercise(client, name, fallback, difficulty))
+
+        raw_results = await asyncio.gather(*all_ex_tasks, return_exceptions=True)
+
+        # Group results by day index
+        day_results: dict[int, list[tuple[str, Optional[dict]]]] = {}
+        for (day_idx, name), res in zip(task_index, raw_results):
+            ex = res if isinstance(res, dict) else None
+            day_results.setdefault(day_idx, []).append((name, ex))
+
+        # Assemble final schedule
         schedule: list[WorkoutDay] = []
-        for day in days:
+        for day_idx, day in enumerate(days):
             if day["is_rest"]:
                 schedule.append(WorkoutDay(
                     day=day["day"], focus=day["focus"], is_rest=True,
@@ -331,42 +361,36 @@ async def _build_schedule(
                 ))
                 continue
 
-            fallback_muscles = _focus_to_muscle_groups(day["focus"])
-
-            # Fetch all exercises for this day concurrently
-            ex_tasks = [
-                _find_exercise(client, name, fallback_muscles, difficulty)
-                for name in day["exercise_names"]
-            ]
-            ex_results = await asyncio.gather(*ex_tasks)
-
-            # Build exercise list; keep order, allow null gif
             seen_ids: set = set()
             day_exercises: list[DayExercise] = []
-            for name, result in zip(day["exercise_names"], ex_results):
-                if result and result["id"] not in seen_ids:
+            for name, result in day_results.get(day_idx, []):
+                if result and result.get("id") not in seen_ids:
                     seen_ids.add(result["id"])
                     day_exercises.append(DayExercise(
                         name=result["name"],
                         gif_url=result.get("gif_url"),
                         muscle_group=result.get("muscle_group"),
                     ))
-                elif result is None:
-                    # include from plan text even if no DB match
+                else:
                     day_exercises.append(DayExercise(name=name))
 
-            # Assign 2 unique videos from the pool (pop so no repeats across days)
             day_videos: list[DayVideo] = []
-            day_cats   = set(_focus_to_video_cats(day["focus"], fitness_goal))
-            # Prefer videos whose category matches this day's focus
-            preferred  = [v for v in video_pool if v.get("category") in day_cats]
-            other      = [v for v in video_pool if v.get("category") not in day_cats]
-            ordered    = preferred + other
-            for vid in ordered:
+            day_cats = set(_focus_to_video_cats(day["focus"], fitness_goal))
+            preferred = [v for v in video_pool if v.get("category") in day_cats]
+            other     = [v for v in video_pool if v.get("category") not in day_cats]
+            for vid in preferred + other:
                 if len(day_videos) >= 2:
                     break
-                video_pool.remove(vid)
-                day_videos.append(DayVideo(**vid))
+                try:
+                    video_pool.remove(vid)
+                    day_videos.append(DayVideo(
+                        id=vid["id"],
+                        title=vid["title"],
+                        youtube_url=f"https://www.youtube.com/watch?v={vid['video_id']}",
+                        channel_name=vid.get("channel_name"),
+                    ))
+                except Exception:
+                    pass
 
             schedule.append(WorkoutDay(
                 day=day["day"], focus=day["focus"], is_rest=False,
@@ -477,7 +501,10 @@ async def generate_summary(plan: dict, query: str, params: dict) -> str:
     try:
         resp = await _gemini.aio.models.generate_content(
             model=_GEMINI_MODEL, contents=prompt,
-            config=genai_types.GenerateContentConfig(temperature=0.7, max_output_tokens=200),
+            config=genai_types.GenerateContentConfig(
+                temperature=0.7, max_output_tokens=200,
+                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+            ),
         )
         return resp.text.strip()
     except Exception:
