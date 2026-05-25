@@ -1,4 +1,4 @@
-"""FitPlan AI — Streamlit frontend for the Workout Recommendation API."""
+"""BetterMe — Streamlit frontend for the Workout Recommendation API."""
 
 import requests
 import streamlit as st
@@ -7,7 +7,7 @@ API_URL = "https://workout-recommendation-api.vercel.app"
 
 # ── Page config (must be the very first Streamlit call) ───────────────────────
 st.set_page_config(
-    page_title="FitPlan AI",
+    page_title="BetterMe",
     page_icon="🏋️",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -297,7 +297,7 @@ def stat_html(label: str, value: str) -> str:
 # ── Profile page ──────────────────────────────────────────────────────────────
 def profile_page():
     # Hero
-    st.markdown('<div class="fp-hero-title">FitPlan AI</div>', unsafe_allow_html=True)
+    st.markdown('<div class="fp-hero-title">BetterMe</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="fp-hero-sub">'
         "Your AI-powered personal trainer. Fill in your profile and get a full "
