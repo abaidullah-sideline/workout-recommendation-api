@@ -143,19 +143,19 @@ class Video(BaseModel):
 class RecommendationResponse(BaseModel):
     plan_id: str
     fitness_goal: str
-    target_timeframe: str
-    activity_level: str
-    gender: str
-    age_group: str
-    bmi_category: str
-    medical_conditions: str
+    target_timeframe: Optional[str] = None
+    activity_level: Optional[str] = None
+    # Only populated when user explicitly provided the value
+    gender: Optional[str] = None
+    age_group: Optional[str] = None
+    bmi_category: Optional[str] = None
+    medical_conditions: Optional[str] = None
     gym_workout_plan: str
     est_calories_burned: int
     exercises: list[Exercise]
     videos: list[Video]
     ai_summary: str
     matched_filters: dict[str, str]
-    # Additive fields — backwards compatible
     workout_frequency: Optional[str] = None
     target_muscle_groups: Optional[list[str]] = None
     condition_note: Optional[str] = None
@@ -437,15 +437,16 @@ async def recommend(request: Request, body: QueryRequest):
 
     freq = params.get("workout_days_per_week")
 
+    # Only surface profile fields the user actually provided — never assume from the plan
     return RecommendationResponse(
         plan_id=plan["plan_id"],
         fitness_goal=plan["fitness_goal"],
-        target_timeframe=plan["target_timeframe"],
-        activity_level=plan["activity_level"],
-        gender=plan["gender"],
-        age_group=plan["age_group"],
-        bmi_category=plan["bmi_category"],
-        medical_conditions=plan["medical_conditions"],
+        target_timeframe=params.get("target_timeframe"),
+        activity_level=params.get("activity_level"),
+        gender=params.get("gender"),
+        age_group=params.get("age_group"),
+        bmi_category=params.get("bmi_category"),
+        medical_conditions=params.get("medical_conditions") or (raw_cond and None),
         gym_workout_plan=plan["gym_workout_plan"],
         est_calories_burned=plan["est_calories_burned"],
         exercises=[Exercise(**e) for e in exercises],
