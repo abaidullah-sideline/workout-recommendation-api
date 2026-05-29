@@ -608,7 +608,7 @@ async def recommend(request: Request, body: QueryRequest):
         generate_summary(plan, body.query, params),
     )
 
-    freq = params.get("workout_days_per_week")
+    active_days = sum(1 for day in schedule if not day.is_rest)
     return RecommendationResponse(
         plan_id=plan["plan_id"],
         fitness_goal=plan["fitness_goal"],
@@ -622,7 +622,7 @@ async def recommend(request: Request, body: QueryRequest):
         schedule=schedule,
         ai_summary=ai_summary,
         matched_filters=matched_filters,
-        workout_frequency=f"{freq} days/week" if freq else None,
+        workout_frequency=f"{active_days} days/week" if active_days else None,
         target_muscle_groups=params.get("target_muscle_groups") or None,
         condition_note=condition_note,
     )
