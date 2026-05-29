@@ -129,7 +129,7 @@ app.add_middleware(
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 class QueryRequest(BaseModel):
-    query: str = Field(..., min_length=10, max_length=500)
+    query: str = Field(..., min_length=10, max_length=1500)
 
     @field_validator("query")
     @classmethod
@@ -183,6 +183,24 @@ _DAY_STARTERS = (
     "Friday", "Saturday", "Sunday", "Weekend",
 )
 
+# Equipment words that are too common to use alone as ilike search terms
+_EQUIPMENT_WORDS = {
+    "barbell", "dumbbell", "cable", "machine", "weighted", "assisted",
+    "smith", "band", "resistance", "lever", "kettlebell",
+}
+
+
+def _search_keywords(name: str) -> list[str]:
+    """Return keywords ordered from most-specific to least-specific."""
+    words = [w for w in re.sub(r"[^\w\s]", "", name.lower()).split() if len(w) > 3]
+    specific = [w for w in words if w not in _EQUIPMENT_WORDS]
+    generic  = [w for w in words if w in _EQUIPMENT_WORDS]
+    # Put specific action words first, then equipment fallbacks; longest first within each group
+    return (
+        sorted(specific, key=len, reverse=True) +
+        sorted(generic,  key=len, reverse=True)
+    )
+
 
 def _parse_plan(text: str) -> list[dict]:
     """Parse gym_workout_plan text into a list of day dicts."""
@@ -205,19 +223,19 @@ def _parse_plan(text: str) -> list[dict]:
 
         is_rest = bool(re.search(r"\brest\b", content, re.IGNORECASE)) or not content
 
-        exercise_names: list[str] = []
+        exercises: list[dict] = []
         if not is_rest:
             for part in content.split(","):
-                part = part.strip().rstrip(".")
-                name = _SETS_REPS_RE.sub("", part).strip()
-                if name and len(name) > 2:
-                    exercise_names.append(name)
+                display = part.strip().rstrip(".")          # e.g. "Barbell Bench Press 4x10"
+                search  = _SETS_REPS_RE.sub("", display).strip()  # e.g. "Barbell Bench Press"
+                if search and len(search) > 2:
+                    exercises.append({"display": display, "search": search})
 
         days.append({
-            "day":            day_name,
-            "focus":          focus,
-            "is_rest":        is_rest,
-            "exercise_names": exercise_names,
+            "day":       day_name,
+            "focus":     focus,
+            "is_rest":   is_rest,
+            "exercises": exercises,
         })
     return days
 
@@ -248,12 +266,26 @@ async def _find_exercise(
     fallback_muscles: list[str],
     difficulty: str,
 ) -> Optional[dict]:
-    """Look up an exercise by name (ilike contains), fall back to muscle group."""
+    """Look up an exercise by name, falling back to muscle group if needed."""
     try:
-        keywords = sorted(
-            [w for w in re.sub(r"[^\w\s]", "", name.lower()).split() if len(w) > 3],
-            key=len, reverse=True,
-        )
+        keywords = _search_keywords(name)
+
+        # Try 2-word phrase first (most precise), e.g. "bench press", "lat pulldown"
+        if len(keywords) >= 2:
+            phrase = f"{keywords[0]} {keywords[1]}"
+            r = await client.get(
+                f"{SUPABASE_REST}/exercises",
+                headers=DB_HEADERS,
+                params={"select": "id,name,gif_url,muscle_group",
+                        "name": f"ilike.*{phrase}*", "limit": "1"},
+            )
+            if r.is_success:
+                data = r.json()
+                rows = data if isinstance(data, list) else []
+                if rows:
+                    return rows[0]
+
+        # Try top-2 single keywords (specific words first, then equipment words)
         for kw in keywords[:2]:
             r = await client.get(
                 f"{SUPABASE_REST}/exercises",
@@ -267,6 +299,7 @@ async def _find_exercise(
                 if rows:
                     return rows[0]
 
+        # Fallback: random exercise from matching muscle group
         for muscle in fallback_muscles:
             r = await client.get(
                 f"{SUPABASE_REST}/exercises",
@@ -333,15 +366,15 @@ async def _build_schedule(
         video_pool = await _fetch_video_pool(client, unique_cats, max(len(active_days) * 3, 20))
 
         # Build ALL exercise tasks for ALL active days at once, then run concurrently
-        task_index: list[tuple[int, str]] = []   # (day_idx, exercise_name)
+        task_index: list[tuple[int, str]] = []   # (day_idx, display_name_with_sets_reps)
         all_ex_tasks = []
         for day_idx, day in enumerate(days):
             if day["is_rest"]:
                 continue
             fallback = _focus_to_muscle_groups(day["focus"])
-            for name in day["exercise_names"]:
-                task_index.append((day_idx, name))
-                all_ex_tasks.append(_find_exercise(client, name, fallback, difficulty))
+            for ex in day["exercises"]:
+                task_index.append((day_idx, ex["display"]))          # keep sets/reps for response
+                all_ex_tasks.append(_find_exercise(client, ex["search"], fallback, difficulty))
 
         raw_results = await asyncio.gather(*all_ex_tasks, return_exceptions=True)
 
@@ -367,7 +400,7 @@ async def _build_schedule(
                 if result and result.get("id") not in seen_ids:
                     seen_ids.add(result["id"])
                     day_exercises.append(DayExercise(
-                        name=result["name"],
+                        name=name,                      # plan text — includes sets/reps
                         gif_url=result.get("gif_url"),
                         muscle_group=result.get("muscle_group"),
                     ))
